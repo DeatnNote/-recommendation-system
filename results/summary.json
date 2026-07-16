@@ -1,0 +1,12 @@
+{
+  "n_users": 6040,
+  "n_movies": 3706,
+  "n_ratings": 853112,
+  "device": "cpu",
+  "epochs": 5,
+  "two_tower_ndcg_at_10": 0.0044,
+  "mf_ndcg_at_10": 0.0507,
+  "pop_ndcg_at_10": 0.0535,
+  "ndcg_lift_vs_pop_pct": -91.78,
+  "ndcg_lift_vs_mf_pct": -91.32
+}
