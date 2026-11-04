@@ -1,258 +1,124 @@
-# 🎬 Movie Recommendation System — Two-Tower Neural Retrieval
+# Two-stage movie recommender: retrieval + learned ranking, evaluated on a time-based split
 
-> **Resume bullet:** *"Built a production-grade movie recommendation system using a Two-Tower neural retrieval architecture (PyTorch, FAISS) trained with Bayesian Personalised Ranking loss on 850k+ implicit interactions — achieving measurable NDCG@10 and Hit Rate@10 lift over Matrix Factorization and popularity baselines; served via a FastAPI endpoint with <50ms retrieval latency and an interactive Streamlit dashboard."*
+> **This repo replaces v1** (a two-tower model on resampled MovieLens data, still in the git history). v1's README called
+> the two-tower "best", but its own `results/eval_results.csv` showed it scoring below a popularity baseline (NDCG@10
+> 0.0044 vs. 0.0535). v2 rebuilds the evaluation on the real MovieLens-1M data with a time-based split and reports what
+> it found, including that the two-tower alone is still the weakest model.
 
----
+A recommender built the way large feeds are built: several retrieval sources each propose
+candidates, then a learned ranker orders them. It's trained and evaluated on the real
+MovieLens-1M dataset (1,000,209 ratings), with a time-based split so no model ever sees ratings
+made after the ones it's tested on, and it's served through a FastAPI endpoint.
 
-## 💼 Business Impact
+```
+user ──► two-tower user vector ──► FAISS top-100 ─┐
+     ──► recent popularity (last 7 days) top-100 ─┼─► ~224 unseen candidates ──► 22 features ──► LightGBM LambdaRank ──► top-k
+     ──► BPR matrix factorization top-100 ────────┘
+```
 
-| Company | How This Architecture Is Used |
+## Results (test window, 1,159 users, 3 seeds)
+
+Full tables with 95% intervals: [`RESULTS.md`](RESULTS.md), generated from `results/*.json`.
+
+| Method | NDCG@10 | Recall@10 | Recall@50 | Catalog coverage@10 |
+|---|---|---|---|---|
+| Popularity (last 7 days) | 0.210 | 0.204 | 0.217 | 3.0% |
+| Item-kNN | 0.185 | 0.179 | 0.194 | 7.1% |
+| BPR matrix factorization | 0.152 | 0.151 | 0.201 | 39.4% |
+| Two-tower retrieval only | 0.133 | 0.130 | 0.170 | 31.1% |
+| **Two-stage: candidates + ranker** | **0.233** | **0.234** | **0.284** | 12.5% |
+| Two-stage without the two-tower | 0.226 | 0.226 | 0.269 | 10.3% |
+
+- **The two-stage system beats the strongest single model by 10.8% on NDCG@10** (paired by user:
+  +0.023, 95% interval +0.015 to +0.031) and by 31% on Recall@50, while recommending four times
+  as much of the catalog.
+- **The strongest single model is plain recent popularity.** On a time-based split, what people
+  rate next is heavily driven by what's current, and every personalized model alone, including
+  the two-tower, scored below it. The ranker wins by combining personalization with freshness: its
+  top features are ratings in the last 7 days, release year, and item quality.
+- **The two-tower is the weakest model alone but still earns its place.** It raises the share of
+  relevant items reaching the ranker from 0.388 to 0.453, and removing it lowers NDCG@10 by 0.007
+  (95% interval 0.003 to 0.011).
+- **Serving:** p50 11.4 ms, p99 18.7 ms per request for the full path (FAISS retrieval, features,
+  ranker, HTTP layer), in-process on 2 CPU cores.
+
+## What is and isn't shown here
+
+- **Real data, offline evaluation only.** No live users and no online A/B test. Offline gains
+  often shrink online.
+- **MovieLens ratings aren't views.** A rating of 4 or 5 is treated as a relevant recommendation.
+- **The two-tower underperforms on its own, and tuning didn't fix it.** I tried an exact softmax
+  over the catalog and in-batch sampled softmax with log-frequency correction, temperatures
+  0.05–0.2, an "example age" feature (Covington et al., 2016), and dropping the user-id embedding.
+  All landed at 0.32–0.35 validation Recall@200, against 0.46 for recent popularity.
+- **The ranker learns from 492 users**, the ones active in the four-week window before the test
+  cutoff (MovieLens-1M users rate in bursts, so few are active in any given window).
+- **Small catalog.** 3,883 movies, so FAISS uses an exact flat index. At a large catalog this
+  would need an approximate index (IVF or HNSW) and a recall-vs-latency trade-off.
+- **No cold start for new movies.** 45 of the 52,107 relevant test items are movies with no
+  earlier ratings, which no model here can recommend.
+
+## Problems caught during development
+
+1. **Unstable ranker size.** Early stopping on a single 20% holdout (~100 users) picked 82, 10,
+   and 34 trees across three seeds, and the 10-tree model scored below the popularity baseline.
+   The number of trees is now chosen from the mean NDCG@10 curve across 5 folds of users. Per-seed
+   NDCG@10 is now 0.230–0.235.
+2. **The API and the offline evaluation disagreed for 6 of 200 users.** Tree models give exact
+   score ties, and the two code paths sorted ties differently. Ties are now broken by item id in
+   both paths, and a test checks that the API returns the same top 10 as the batch evaluation.
+3. **123 ms median latency.** Profiling showed 104 ms of each request going to item-kNN scoring,
+   which copied a dense 60 MB similarity matrix on every call. Storing only each item's top
+   neighbors as a sparse matrix brought the median to 11.4 ms.
+
+## How it works
+
+| Component | File |
 |---|---|
-| **YouTube** | Two-tower retrieval selects 100s of candidates from millions of videos before ranking |
-| **Netflix** | User and item towers trained on watch history — powers the homepage row recommendations |
-| **Spotify** | Session-based user tower + audio feature item tower for Discover Weekly |
-| **Pinterest** | PinSage: graph-augmented item tower over pin embeddings (2018 KDD best paper) |
-| **DoorDash** | Restaurant retrieval from user order history and location context |
+| Data loading and time-based split | `recsys/data.py` |
+| Popularity, item-kNN, BPR-MF baselines | `recsys/baselines.py` |
+| Two-tower model, FAISS retrieval | `recsys/two_tower.py` |
+| Candidates, features, LambdaRank ranker | `recsys/ranker.py` |
+| Experiment runner (3 seeds) | `recsys/pipeline.py` |
+| FastAPI service, latency benchmark | `recsys/serve.py`, `recsys/bench.py` |
+| Report generator | `recsys/report.py` |
 
-This repo implements the same retrieval stage these companies use — the piece that goes from "millions of items" to "hundreds of candidates" before downstream ranking. It's the highest-leverage component because ranking quality is bounded by retrieval recall: if the right item isn't retrieved, no ranker can fix it.
+**Split.** Ratings are cut at the 80th and 90th percentiles of time. Stage-1 models are fit on
+events before the 80th percentile, and the ranker learns from labels between the 80th and 90th.
+For the test, stage-1 models are refit on everything before the 90th percentile, and the trained
+ranker scores ratings after it. All hyperparameters were chosen on the validation window only.
 
----
+**Two-tower.** The user tower takes the user id, demographics, and the mean of the 50 most recent
+items. The item tower takes the item id, genres, and release year. Each training example only sees
+the items the user rated *before* it, matching what the model gets at serving time.
 
-## 🏗️ Architecture
+**Ranker features.** The 22 features are retrieval scores and ranks (two-tower, BPR, item-kNN),
+recent and all-time popularity and trend, days since an item's first rating, shrunk mean rating,
+release year, genre match with the user's history, user activity, demographics, and which
+sources proposed the item. All are
+computed only from events before the cutoff.
 
-```
-                    TRAINING
-                    ────────
-User idx ──► User Tower ──► user_vec (64-dim, L2-normalised)
-                                    ↘
-                                  BPR Loss: -log σ(pos_score - neg_score)
-                                    ↗
-Item idx ──► Item Tower ──► item_vec (64-dim, L2-normalised)
+**Metrics.** NDCG@10, Recall@10 and @50 (hits divided by min(relevant, K)), Hit@10, and catalog
+coverage. Per-user metrics are averaged over three seeds, then bootstrapped over users.
 
-                    INFERENCE
-                    ─────────
-User idx ──► User Tower ──► user_vec
-                                ↓
-                          FAISS IndexFlatIP
-                          (pre-indexed item vectors)
-                                ↓
-                          Top-k items (cosine similarity)
-                          Latency: <50ms
-```
-
-### User Tower
-```
-user_idx → Embedding(128) → BatchNorm → Linear(256) → ReLU → Dropout(0.2) → Linear(64) → L2-norm
-```
-
-### Item Tower
-```
-item_idx → Embedding(128) → BatchNorm → Linear(256) → ReLU → Dropout(0.2) → Linear(64) → L2-norm
-```
-
-### Why Two Towers?
-
-| Advantage | Explanation |
-|---|---|
-| **Scalability** | Item vectors are pre-computed once; retrieval = one matrix multiply |
-| **Latency** | FAISS approximate search over 3,700 items runs in <1ms (millions in <50ms) |
-| **Separation** | User tower runs at request time; item tower updates offline on a schedule |
-| **Extensibility** | Add side features (genres, release year) to the item tower without changing the user tower |
-
----
-
-## 📊 Evaluation Results
-
-Results on a 1,000-user held-out test set (leave-one-out split):
-
-| Model | NDCG@10 | Recall@10 | Hit Rate@10 | Coverage | Novelty |
-|---|---|---|---|---|---|
-| Popularity Baseline | ~0.035 | ~0.070 | ~0.070 | 0.004 | 0.5 |
-| Matrix Factorization | Better than Pop | Better | Better | Higher | Higher |
-| **Two-Tower (BPR+FAISS)** | **Best** | **Best** | **Best** | **Highest** | **Highest** |
-
-> Run `python pipeline.py` to generate exact numbers for your dataset — results are saved to `results/eval_results.csv`.
-
-### Metric Definitions
-
-| Metric | Formula | What it measures |
-|---|---|---|
-| **NDCG@k** | DCG@k / IDCG@k | Ranking quality — rewards relevant items at higher positions |
-| **Recall@k** | hits / \|relevant\| | Coverage — what fraction of known relevant items are retrieved |
-| **Hit Rate@k** | 1 if any hit in top-k | Binary relevance — did we retrieve the held-out item? |
-| **Coverage** | \|recommended items\| / \|all items\| | Catalogue coverage across all users |
-| **Novelty** | mean self-information of recs | How niche/unpopular the recommended items are |
-
-### Why BPR over MSE?
-
-Matrix Factorization minimises MSE on explicit ratings — it optimises for accurate score prediction. But recommendation is fundamentally a **ranking** problem: we don't care if the predicted score is exactly 4.2 or 4.3; we care that item A ranks above item B.
-
-BPR (Bayesian Personalised Ranking) directly optimises for this: for each (user, positive_item, negative_item) triple, it maximises the margin between the positive and negative item scores. This produces better ranking metrics (NDCG, Hit Rate) even when MSE is comparable.
-
----
-
-## 📁 Project Structure
-
-```
-recommendation-system/
-├── data/
-│   ├── generate_data.py          ← Synthetic MovieLens-style data generator
-│   ├── movies.csv                ← 3,706 movies with genres
-│   ├── users.csv                 ← 6,040 users with demographics
-│   └── ratings.csv               ← ~850k ratings
-├── src/
-│   ├── dataset.py                ← Data loading, ID remapping, train/val/test split, PyTorch datasets
-│   ├── baselines.py              ← Popularity baseline + Matrix Factorization
-│   └── two_tower.py              ← Two-Tower model, BPR loss, FAISS index
-├── evaluation/
-│   └── metrics.py                ← Precision@k, Recall@k, NDCG@k, Coverage, Novelty
-├── serving/
-│   └── api.py                    ← FastAPI REST API (recommend + similar items endpoints)
-├── dashboard/
-│   └── app.py                    ← Streamlit interactive dashboard (5 tabs)
-├── models/                       ← Saved weights (generated by pipeline.py)
-│   ├── two_tower.pt
-│   ├── two_tower.faiss
-│   └── mf.pt
-├── results/                      ← Evaluation outputs
-│   ├── eval_results.csv
-│   ├── training_curves.csv
-│   └── summary.json
-├── pipeline.py                   ← End-to-end: data → train → evaluate → save
-└── requirements.txt
-```
-
----
-
-## 🚀 Quickstart
-
-### 1. Install
+## How to run
 
 ```bash
-git clone https://github.com/DeatnNote/recommendation-system
-cd recommendation-system
+python -m venv venv && . venv/bin/activate      # Windows: .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+
+python scripts/get_data.py       # downloads MovieLens-1M from GroupLens into data/raw/
+python -m recsys.pipeline        # 3 seeds, about 11 minutes on 2 CPU cores
+python -m recsys.bench           # latency
+python -m recsys.report          # regenerate RESULTS.md
+pytest -q                        # 16 tests
+
+uvicorn recsys.serve:app --port 8000
+curl "localhost:8000/recommend/1?k=10"
 ```
 
-### 2. Generate data
-
-```bash
-python data/generate_data.py
-# → data/ratings.csv  (850k rows)
-# → data/movies.csv   (3,706 rows)
-# → data/users.csv    (6,040 rows)
-```
-
-### 3. Train all models + evaluate
-
-```bash
-python pipeline.py
-# Trains: Popularity → Matrix Factorization → Two-Tower
-# Evaluates all three, saves results to results/
-# Runtime: ~5–15 min on CPU (faster with GPU)
-```
-
-### 4. Launch the dashboard
-
-```bash
-streamlit run dashboard/app.py
-# → http://localhost:8501
-```
-
-### 5. Start the API
-
-```bash
-uvicorn serving.api:app --host 0.0.0.0 --port 8000
-# → http://localhost:8000/docs  (auto-generated Swagger UI)
-```
-
----
-
-## 🌐 API Reference
-
-### `GET /recommend/{user_id}?n=10`
-```json
-{
-  "user_id": 42,
-  "user_idx": 41,
-  "recommendations": [
-    {"movie_id": 101, "title": "Movie 101 (1994)", "genres": "Action|Drama", "score": 0.847},
-    ...
-  ],
-  "latency_ms": 3.2,
-  "model": "TwoTower"
-}
-```
-
-### `GET /similar/{movie_id}?n=10`
-Returns the 10 most similar movies to `movie_id` via item-item cosine similarity.
-
-### `GET /health`
-```json
-{"status": "ok", "model": "TwoTower (BPR + FAISS)", "n_items_indexed": 3706}
-```
-
----
-
-## 🔬 Key Design Decisions
-
-**Leave-one-out split** — Each user's most recent interaction is held out for test, second-most-recent for val, rest for train. The standard in RecSys literature (He et al., 2017 NCF paper) because it simulates the real scenario: predict what a user will interact with next.
-
-**Implicit feedback** — Ratings ≥ 3.5 are treated as positive interactions; lower ratings are discarded rather than treated as negative. This is standard practice: a 2-star rating still means the user engaged with the item (clicked, watched, read), which is a different signal from never having seen it.
-
-**Negative sampling (BPR)** — For each positive interaction, we sample 4 random items the user has never seen as negatives. This is an approximation — sampled items might actually be items the user would like. More sophisticated approaches (hard negative mining, popularity-weighted sampling) would improve training efficiency.
-
-**FAISS IndexFlatIP** — Exact inner product search over L2-normalised vectors = exact cosine similarity. For 3,700 items this is fast enough. At YouTube scale (millions of videos), you'd switch to FAISS IVF (inverted file index) or HNSW for approximate search at the cost of a small recall reduction.
-
----
-
-## ⚠️ Known Limitations
-
-| Limitation | Impact | Production Fix |
-|---|---|---|
-| ID-only features | No content signals (genre, year, description) | Add item metadata to item tower |
-| No temporal dynamics | Treats all interactions equally regardless of recency | Session-based or time-aware embeddings |
-| Static FAISS index | Stale if new items added | Online index updates or periodic rebuilds |
-| No re-ranking stage | Returns retrieval output directly | Add LightGBM re-ranker with interaction features |
-| Popularity bias in negatives | Niche items under-represented as negatives | Hard negative mining |
-
----
-
-## 🔮 Roadmap
-
-- [x] Popularity baseline
-- [x] Matrix Factorization (pointwise MSE)
-- [x] Two-Tower (BPR + FAISS retrieval)
-- [x] Offline evaluation: NDCG@k, Recall@k, Hit Rate@k, Coverage, Novelty
-- [x] FastAPI serving endpoint (<50ms latency)
-- [x] Streamlit dashboard (recommendations, similar items, model comparison)
-- [ ] Side features: genre embeddings, release year, average rating in item tower
-- [ ] Hard negative mining (mine from top-k false positives)
-- [ ] LightGBM re-ranking stage on top-k candidates
-- [ ] Session-based model (GRU4Rec) for sequential recommendation
-- [ ] Approximate FAISS index (IVF/HNSW) for million-scale retrieval
-- [ ] A/B test framework for online evaluation
-
----
-
-## 🎤 Interview Q&A
-
-**Q: Why use a two-tower architecture instead of a single model that takes (user, item) as joint input?**
-A joint model (like MLP on concatenated user+item features) requires a forward pass for every (user, item) pair at inference time — that's O(users × items) computations, which is computationally infeasible at scale. A two-tower model separates user and item encoding: item vectors are pre-computed once and indexed in FAISS. At request time you only compute one user vector, then run a FAISS nearest-neighbour search — O(d × n_items) where d is the embedding dimension. At YouTube's scale, this is the difference between milliseconds and minutes per request.
-
-**Q: What is BPR loss and why is it better than MSE for recommendations?**
-BPR (Bayesian Personalised Ranking) is a pairwise ranking loss: for each (user, positive_item, negative_item) triple, it maximises the margin between the model's score for the positive vs negative item via `−log σ(score_pos − score_neg)`. MSE minimises the difference between predicted and actual ratings — it's optimising for rating prediction accuracy. But recommendation is a ranking problem: we care that good items rank above bad ones, not that scores are numerically accurate. BPR directly optimises ranking, which is why it consistently outperforms MSE on NDCG and Hit Rate metrics even when the MSE model has lower MSE.
-
-**Q: How would you scale this to 100 million items?**
-Two changes: first, replace FAISS IndexFlatIP (exact search) with IndexIVFPQ (product quantisation + inverted file index) which compresses vectors and partitions the index — trading a small recall reduction for orders-of-magnitude speed improvement. Second, move from a single FAISS index on one machine to a distributed retrieval system (ScaNN on Google's infrastructure, or FAISS served via a distributed index across shards). The two-tower model itself doesn't change — the same user and item towers work at any scale, the retrieval layer scales independently.
-
-**Q: How do you evaluate a recommendation system without ground truth labels?**
-Offline evaluation uses historical interactions as ground truth. Leave-one-out: each user's most recent interaction is held out; the model must retrieve that item in its top-k. This gives NDCG@k, Recall@k, and Hit Rate@k. But offline metrics are imperfect — they can only measure known positives, not unknown positives (items the user would have liked but never saw). Online evaluation via A/B test is the ground truth: measure click-through rate, session depth, and long-term retention on treatment vs control. Both are necessary: offline for rapid iteration, online for deployment decisions.
-
----
-
-## 👤 Author
-
-**Amogh** — [LinkedIn](https://linkedin.com/in/YOUR_LINKEDIN) · [GitHub](https://github.com/DeatnNote) · [HuggingFace](https://huggingface.co/Amoghds)
-
-*Built as part of an end-to-end ML/Data Science portfolio targeting Applied Scientist and ML Engineer roles.*
+The dataset isn't included in this repo (GroupLens terms). The committed results were produced
+from a tab-separated conversion of MovieLens-1M with the official counts (1,000,209 ratings, 6,040
+users, 3,883 movies). The loader reads either that format or GroupLens' own `.dat` files, and a
+test checks that both load identically. Exact numbers may still differ slightly by machine,
+because PyTorch and LightGBM training aren't bit-for-bit reproducible across hardware.

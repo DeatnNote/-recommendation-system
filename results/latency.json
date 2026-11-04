@@ -1,0 +1,9 @@
+{
+  "requests": 500,
+  "k": 10,
+  "p50_ms": 11.38436549990729,
+  "p95_ms": 15.077384800406435,
+  "p99_ms": 18.66745640991207,
+  "cpu_cores": 2,
+  "note": "in-process FastAPI TestClient, single request at a time, no network hop"
+}

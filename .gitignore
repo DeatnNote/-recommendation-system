@@ -1,0 +1,7 @@
+data/raw/
+artifacts/
+__pycache__/
+*.pyc
+venv/
+scratch/
+.pytest_cache/
